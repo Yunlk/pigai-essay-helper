@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         批改网模拟打字输入
 // @namespace    local.pigai.typing-simulator
-// @version      2.1.0
+// @version      2.1.4
 // @description  用 OpenAI 兼容接口生成作文，并在批改网作文框中逐字输入。
-// @match        https://www.pigai.org/index.php*
+// @match        https://www.pigai.org/*
+// @match        https://pigai.org/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      *
@@ -66,26 +67,133 @@
         };
     }
 
-    // 从中英文题目要求中提取标题，优先匹配明确的 Title/题目/标题字段。
+    // 清理提取出的标题：优先取引号/书名号内的内容，再去掉尾随的说明文字和标点。
+    function cleanTitle(value) {
+        if (!value) return '';
+        let text = String(value).replace(/\s+/g, ' ').trim();
+
+        // 标题被引号或书名号包裹时只取其中的内容，
+        // 这样 `Title: "My Campus Life". Write at least 120 words` 只会留下标题本身。
+        const wrapped = /["\u201c\u2018]\s*([^"\u201d\u2019]{1,160}?)\s*["\u201d\u2019]/.exec(text)
+            || /《\s*([^》]{1,160}?)\s*》/.exec(text);
+        if (wrapped && wrapped[1] && wrapped[1].trim()) text = wrapped[1].trim();
+
+        text = text
+            .replace(/^[（(【\[]+/, '')
+            .replace(/[）)】\]]+$/, '')
+            .replace(/^["'\u201c\u201d\u2018\u2019《》]+/, '')
+            .replace(/["'\u201c\u201d\u2018\u2019《》]+$/, '')
+            .trim();
+
+        // 只按真正的句末标点截断尾随说明，避免把 `（三）` 之类的标题内部标点也切掉。
+        const cut = text.search(/(?:[.!?]\s+\S|[。！？]\s*\S)/);
+        if (cut > 0) text = text.slice(0, cut);
+
+        return text
+            .replace(/[。！？.!?]+$/, '')
+            .replace(/[，,；;：:、~～\-—]+$/, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    // 判断候选文本是否像一个标题：不能是元信息，也不能短到只是标点或单字。
+    function looksLikeTitle(value) {
+        const text = cleanTitle(value);
+        if (text.length < 2) return false;
+        if (text.length > 160) return false;
+        // 明显是页面元信息或提示语的内容要排除。
+        return !/(作文号|教师|字数|满分|截止时间|注意|请选择|请在下方|禁止粘贴|检测|用时|学号)/.test(text);
+    }
+
+    // 从中英文题目要求中提取标题。按"明确字段 -> 常见句式 -> 兜底"的顺序匹配，
+    // 逐行尝试，越靠前的规则越不容易误判。
     function extractTitle(prompt) {
-        const patterns = [
-            /(?:essay\s+)?(?:topic|title)\s*[:：]?\s*["““']([^"””']+)["””']/i,
-            /(?:作文题目|题目|标题)\s*[:：]\s*["““']?([^"””'\r\n]+)["””']?/i,
-            /topic\s+["““']([^"””']+)["””']/i,
+        if (!prompt) return '';
+        const lines = String(prompt)
+            .split(/\r?\n/)
+            .map((line) => line.replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+
+        // 明确给出标题的字段：标题：xxx / Title: xxx / 要求 xxx
+        const labelPatterns = [
+            // 批改网的题干常带作业编号前缀，如 `写作2-Reflections on My Choice of Major`
+            // 或 `题目：[3435109]25级...-写作2-Reflections on My Choice of Major`，
+            // 标题就在 `写作N-` 之后，因此优先按这个结构精确提取。
+            /(?:写作|作文|Unit|Lesson|Chapter)\s*\d+\s*[-–—.、:：]\s*(.+)$/i,
+            /(?:作文题目|文章题目|题目|标题)\s*[:：]\s*\[?\d*\]?\s*(.+)/i,
+            /^(?:写作)?要求\s*[:：]?\s*(.+)$/i,
+            /(?:作文题目|文章题目|题目|标题)\s*[:：]\s*(.+)/i,
+            /(?:essay\s+)?(?:topic|title)\s*[:：]\s*(.+)/i,
+            // "Your title: A Memorable Trip."
+            /your\s+(?:essay\s+)?title\s*(?:is|:)\s*(.+)/i,
+            /the\s+title\s+of\s+your\s+essay\s+should\s+be\s+(.+)/i,
         ];
-        for (const pattern of patterns) {
-            const match = prompt.match(pattern);
-            if (match && match[1]) return match[1].trim().replace(/[。.!！?？]+$/, '');
+
+        // 常见句式：about "xxx" / entitled "xxx" / titled "xxx"
+        const quotedPhrase = (keyword) => new RegExp(
+            keyword + '\\s*[:：]?\\s*["\u201c\u2018\']([^"\u201d\u2019\']+)[\\s\\S]{0,40}?["\u201d\u2019\']',
+            'i'
+        );
+        const phrasePatterns = [
+            quotedPhrase('about'),
+            quotedPhrase('entitled'),
+            quotedPhrase('titled'),
+            quotedPhrase('topic'),
+            quotedPhrase('on\\s+the\\s+topic'),
+        ];
+
+        for (const line of lines) {
+            for (const pattern of labelPatterns) {
+                const match = line.match(pattern);
+                if (match && looksLikeTitle(match[1])) return cleanTitle(match[1]);
+            }
         }
+
+        const plain = lines.join(' ');
+        for (const pattern of phrasePatterns) {
+            const match = plain.match(pattern);
+            if (match && looksLikeTitle(match[1])) return cleanTitle(match[1]);
+        }
+
+        // 兜底一：书名号包裹的标题，如《我的家乡》
+        const bracket = plain.match(/《([^》]{1,120})》/);
+        if (bracket && looksLikeTitle(bracket[1])) return cleanTitle(bracket[1]);
+
+        // 兜底二：整句里唯一的短引号片段，通常就是标题而不是说明文字。
+        const quoted = plain.match(/["\u201c\u2018]([^"\u201d\u2019]{1,120})["\u201d\u2019]/);
+        if (quoted && looksLikeTitle(quoted[1])) return cleanTitle(quoted[1]);
+
+        // 兜底三：批改网的题干直接把标题写在要求段落里，形如
+        // `写作2-Reflections on My Choice of Major`，没有引号也没有字段名。
+        // 去掉开头的作业编号前缀后，整行就是标题。
+        for (const line of lines) {
+            if (/(作文号|教师|字数|满分|注意|截止时间|当前时间|用时)/.test(line)) continue;
+            const stripped = line.replace(/^(?:写作|作文|Unit|Lesson|Chapter)\s*\d+\s*[-–—.、:：]\s*/i, '').trim();
+            if (stripped !== line && looksLikeTitle(stripped)) return cleanTitle(stripped);
+        }
+
         return '';
     }
 
+    // 定位页面标题输入框。页面改版时 #title 可能不在，做一次保守的兜底查找。
+    function findTitleInput() {
+        const direct = document.querySelector('input#title');
+        if (direct) return direct;
+        const form = document.querySelector('#request_y')?.closest('form') || document;
+        return form.querySelector('input[name="title"], input#essay_title, input.title');
+    }
+
     // 将解析出的标题写入批改网标题框，并触发页面表单监听。
+    // 不改动焦点：填标题发生在打字开始前，抢焦点会打断后续的作文输入。
     function fillPageTitle(title) {
-        const target = document.querySelector('input#title');
+        const target = findTitleInput();
         if (!target || !title || target.disabled || target.readOnly) return false;
-        target.focus();
-        target.setRangeText(title, 0, target.value.length, 'end');
+        setNativeValue(target, title);
+        try {
+            target.setSelectionRange(title.length, title.length);
+        } catch (_) {
+            // 忽略不支持设置选区的场景。
+        }
         target.dispatchEvent(new Event('input', { bubbles: true }));
         target.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
@@ -97,7 +205,13 @@
         if (autoTitle && !autoTitle.checked) return '';
         try {
             const requirement = readEssayRequirement();
-            if (requirement.title && fillPageTitle(requirement.title)) return requirement.title;
+            if (!requirement.title) {
+                // 提示而不是静默失败，便于判断是"题目里没有标题"还是"选择器不对"。
+                setStatus('已识别题目，但未从题干中提取到标题；如需填写请在页面手动输入', 'paused');
+                return '';
+            }
+            if (fillPageTitle(requirement.title)) return requirement.title;
+            setStatus(`已提取到标题“${requirement.title}”，但未找到页面标题输入框 #title`, 'error');
         } catch (_) {
             // 页面暂未渲染题目时保留原标题，不阻断作文输入。
         }
@@ -241,12 +355,61 @@
         status.dataset.kind = kind;
     }
 
+    // 通过原型上的原生 value setter 改值，让 React/Vue 等框架能感知到这次修改。
+    function setNativeValue(element, value) {
+        const prototype = element instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+        if (descriptor && typeof descriptor.set === 'function') {
+            descriptor.set.call(element, value);
+            return;
+        }
+        element.value = value;
+    }
+
+    // 不依赖焦点地插入文本：焦点在框内时沿用光标位置，否则把内容追加到结尾。
+    // 插入区间在改值之前算好，避免非聚焦状态下 selection 为 0 导致文字被插到开头或丢失。
     function insertTextIntoSource(source, text) {
-        if (!source || !text) return;
-        const start = Number.isInteger(source.selectionStart) ? source.selectionStart : source.value.length;
-        const end = Number.isInteger(source.selectionEnd) ? source.selectionEnd : start;
-        source.setRangeText(text, start, end, 'end');
-        source.dispatchEvent(new Event('input', { bubbles: true }));
+        if (!source || text === undefined || text === null) return;
+        const next = String(text);
+        if (!next) return;
+        if (source.disabled || source.readOnly) return;
+
+        const value = String(source.value ?? '');
+        let start;
+        let end;
+        if (source === document.activeElement) {
+            start = Number.isInteger(source.selectionStart) ? source.selectionStart : value.length;
+            end = Number.isInteger(source.selectionEnd) ? source.selectionEnd : start;
+        } else {
+            start = value.length;
+            end = value.length;
+        }
+        start = Math.max(0, Math.min(start, value.length));
+        end = Math.max(start, Math.min(end, value.length));
+
+        const caret = start + next.length;
+        setNativeValue(source, value.slice(0, start) + next + value.slice(end));
+        try {
+            source.setSelectionRange(caret, caret);
+        } catch (_) {
+            // 个别 input 类型不支持设置选区，忽略即可。
+        }
+
+        // inputType 区分覆盖选区与追加，便于页面上的字数统计等监听器正确处理。
+        let event;
+        try {
+            event = new InputEvent('input', {
+                inputType: 'insertText',
+                data: next,
+                bubbles: true,
+                composed: true,
+            });
+        } catch (_) {
+            event = new Event('input', { bubbles: true });
+        }
+        source.dispatchEvent(event);
     }
 
     // 在插件输入框内自行处理粘贴，阻断批改网页对 paste 事件的拦截。
@@ -285,59 +448,10 @@
         setStatus(`已从剪贴板读取 ${text.length} 字符`, 'done');
     }
 
-    // 发送键盘和输入事件；isTrusted 由浏览器控制，脚本只负责完整触发监听链。
-    function dispatchTypingEvents(target, char) {
-        const key = char === '\n' ? 'Enter' : char === ' ' ? ' ' : char;
-        const code = char === '\n' ? 'Enter' : char === ' ' ? 'Space' : '';
-        const keyboardInit = {
-            key,
-            code,
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-        };
-
-        target.dispatchEvent(new KeyboardEvent('keydown', keyboardInit));
-
-        let beforeInput;
-        try {
-            beforeInput = new InputEvent('beforeinput', {
-                inputType: 'insertText',
-                data: char,
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-            });
-        } catch (_) {
-            beforeInput = new Event('beforeinput', {
-                bubbles: true,
-                cancelable: true,
-            });
-        }
-        target.dispatchEvent(beforeInput);
-
-        target.dispatchEvent(new KeyboardEvent('keypress', keyboardInit));
-
-        // 使用 setRangeText 保留光标位置，比直接拼接 value 更接近实际输入行为。
-        const start = Number.isInteger(target.selectionStart)
-            ? target.selectionStart
-            : target.value.length;
-        const end = Number.isInteger(target.selectionEnd) ? target.selectionEnd : start;
-        target.setRangeText(char, start, end, 'end');
-
-        let inputEvent;
-        try {
-            inputEvent = new InputEvent('input', {
-                inputType: 'insertText',
-                data: char,
-                bubbles: true,
-                composed: true,
-            });
-        } catch (_) {
-            inputEvent = new Event('input', { bubbles: true });
-        }
-        target.dispatchEvent(inputEvent);
-        target.dispatchEvent(new KeyboardEvent('keyup', keyboardInit));
+    // 逐字符写入。合成键盘事件（isTrusted 恒为 false）对页面没有实际作用，
+    // 这里只负责改值并派发 input 事件，因此不再要求目标元素处于聚焦状态。
+    function typeCharInto(target, char) {
+        insertTextIntoSource(target, char);
     }
 
     // 生成小幅波动的间隔；基础速度稳定，标点后增加短暂停顿。
@@ -351,24 +465,99 @@
         return Math.max(18, base * speedFactor + extra);
     }
 
-    // 将等待拆成小片段，使暂停和停止按钮能在当前延时内及时生效。
-    async function waitWithControls(milliseconds, runId) {
-        let remaining = milliseconds;
-        while (remaining > 0) {
-            if (state.stopRequested || state.runId !== runId) return false;
-            while (state.paused) {
-                if (state.stopRequested || state.runId !== runId) return false;
-                await new Promise((resolve) => setTimeout(resolve, 60));
+    // 后台安全的定时等待。
+    // 页面切到后台后 setTimeout 会被浏览器节流（先降到 >=1s，长时间隐藏后约 1 次/分钟），
+    // 纯定时器驱动会让打字实际停住。这里分两条路径：
+    //   前台：原生 setTimeout，延时精确，不产生任何额外流量。
+    //   后台：由 requestAnimationFrame 限速驱动 + MessageChannel 自查，
+    //         两者都不依赖 setTimeout，因此不会被"冻结"到停住。
+    const sleep = (() => {
+        if (typeof MessageChannel !== 'function') {
+            // 极端兜底：没有 MessageChannel 时只能依赖 setTimeout，此时后台仍会被节流。
+            return (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+        const channel = new MessageChannel();
+        // 打字循环是串行的，同一时刻只有一个等待者。
+        let waiter = null;
+        let beatScheduled = false;
+
+        // 后台心跳的节拍器。rAF 在后台本就低频，天然限制了自查次数；
+        // 没有 rAF 时退回 setTimeout（可能被节流，但不影响正确性）。
+        const scheduleBeat = typeof requestAnimationFrame === 'function'
+            ? (callback) => requestAnimationFrame(callback)
+            : (callback) => setTimeout(callback, 60);
+
+        function requestBeat() {
+            if (beatScheduled || !waiter || waiter.settled) return;
+            beatScheduled = true;
+            scheduleBeat(() => {
+                beatScheduled = false;
+                if (!waiter || waiter.settled) return;
+                channel.port2.postMessage(null);
+            });
+        }
+
+        // 收到自查消息时只做一次判断，绝不在这里连续续期，避免空转。
+        channel.port1.onmessage = () => {
+            if (!waiter || waiter.settled) {
+                waiter = null;
+                return;
             }
-            const slice = Math.min(60, remaining);
-            await new Promise((resolve) => setTimeout(resolve, slice));
-            remaining -= slice;
+            if (Date.now() - waiter.startedAt >= waiter.span) {
+                waiter.finish();
+                return;
+            }
+            requestBeat();
+        };
+
+        return function sleep(milliseconds) {
+            const span = Math.max(0, Number(milliseconds) || 0);
+            if (span === 0) return Promise.resolve();
+            return new Promise((resolve) => {
+                const entry = {
+                    span,
+                    startedAt: Date.now(),
+                    settled: false,
+                    finishTimer: null,
+                };
+                entry.finish = () => {
+                    if (entry.settled) return;
+                    entry.settled = true;
+                    if (entry.finishTimer !== null) clearTimeout(entry.finishTimer);
+                    if (waiter === entry) waiter = null;
+                    resolve();
+                };
+                waiter = entry;
+                // 计时器在任何情况下都保留：前台它就是精确计时，
+                // 后台它可能被推迟，此时由心跳负责把等待推进。
+                entry.finishTimer = setTimeout(entry.finish, span);
+                if (document.hidden === true) {
+                    channel.port2.postMessage(null);
+                }
+            });
+        };
+    })();
+
+    // 按真实经过时间计时，避免后台节流导致等待被拉长后节奏失控。
+    async function waitWithControls(milliseconds, runId) {
+        const deadline = Date.now() + milliseconds;
+        while (true) {
+            if (state.stopRequested || state.runId !== runId) return false;
+            if (state.paused) {
+                // 暂停期间也要保持可响应，且不能依赖被节流的定时器。
+                await sleep(60);
+                continue;
+            }
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            await sleep(Math.min(60, remaining));
         }
         return !state.stopRequested && state.runId === runId;
     }
 
     // 逐字符执行输入，并在异常、停止或文本框被替换时安全收尾。
-    async function typeText(text, speed, clearExisting) {
+    // stealFocus 为 false 时全程不抢焦点，打字过程中仍可正常操作面板和其他区域。
+    async function typeText(text, speed, clearExisting, stealFocus) {
         const target = findTarget();
         if (!target) throw new Error('未找到作文文本框 #contents');
         if (target.disabled || target.readOnly) throw new Error('作文文本框当前不可编辑');
@@ -380,12 +569,16 @@
         state.target = target;
         state.typed = 0;
 
+        if (stealFocus) target.focus();
+
         if (clearExisting) {
-            target.focus();
-            target.setRangeText('', 0, target.value.length, 'end');
+            setNativeValue(target, '');
+            try {
+                target.setSelectionRange(0, 0);
+            } catch (_) {
+                // 忽略不支持设置选区的场景。
+            }
             target.dispatchEvent(new Event('input', { bubbles: true }));
-        } else {
-            target.focus();
         }
 
         try {
@@ -393,14 +586,14 @@
                 if (state.stopRequested || state.runId !== runId) break;
                 while (state.paused) {
                     setStatus(`已暂停：${state.typed}/${text.length} 字符`, 'paused');
-                    await new Promise((resolve) => setTimeout(resolve, 80));
+                    await sleep(80);
                     if (state.stopRequested || state.runId !== runId) break;
                 }
                 if (state.stopRequested || state.runId !== runId) break;
 
                 const currentTarget = findTarget();
                 if (currentTarget !== target) throw new Error('作文文本框已被页面重新加载');
-                dispatchTypingEvents(target, text[index]);
+                typeCharInto(target, text[index]);
                 state.typed = index + 1;
                 setStatus(`输入中：${state.typed}/${text.length} 字符`, 'running');
 
@@ -504,6 +697,9 @@
                 <label><input id="pigai-typing-clear" type="checkbox" checked> 开始前清空文本框</label>
             </div>
             <div class="pigai-row">
+                <label><input id="pigai-typing-focus" type="checkbox"> 打字时抢占焦点（默认关闭，可边打字边操作页面）</label>
+            </div>
+            <div class="pigai-row">
                 <label><input id="pigai-auto-title" type="checkbox" checked> 自动填写页面标题</label>
             </div>
             <div class="pigai-actions">
@@ -546,9 +742,15 @@
                 setStatus('速度需为不小于 30 的数字', 'error');
                 return;
             }
-            fillTitleFromPage();
+            const titleFilled = fillTitleFromPage();
+            if (titleFilled) setStatus(`标题已填入：“${titleFilled}”，正在准备输入...`, 'done');
             try {
-                typeText(source, Math.min(1200, speed), $('#pigai-typing-clear').checked)
+                typeText(
+                    source,
+                    Math.min(1200, speed),
+                    $('#pigai-typing-clear').checked,
+                    $('#pigai-typing-focus').checked
+                )
                     .catch((error) => {
                         state.running = false;
                         refreshButtons();
